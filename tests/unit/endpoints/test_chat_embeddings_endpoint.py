@@ -73,7 +73,9 @@ class TestChatEmbeddingsEndpoint:
         assert len(message["content"]) == 2
         assert message["content"][0]["type"] == "text"
         assert message["content"][1]["type"] == "image_url"
-        assert message["content"][1]["image_url"]["url"] == "data:image/png;base64,abc123"
+        assert (
+            message["content"][1]["image_url"]["url"] == "data:image/png;base64,abc123"
+        )
 
     def test_format_payload_model_fallback(self, endpoint, model_endpoint):
         """Test that endpoint model is used when turn model is None."""
