@@ -6,6 +6,15 @@ from pathlib import Path
 
 import pytest
 
+from aiperf.common.config import (
+    AudioConfig,
+    EndpointConfig,
+    ImageConfig,
+    InputConfig,
+    PromptConfig,
+    UserConfig,
+    VideoConfig,
+)
 from aiperf.common.models import Text
 from aiperf.dataset.loader.models import RandomPool
 from aiperf.dataset.loader.random_pool import RandomPoolDatasetLoader
@@ -395,3 +404,317 @@ class TestRandomPoolDatasetLoader:
         image_contents = tuple(i.contents[0] for i in turn2.images)
         assert text_contents in possible_text_contents
         assert image_contents in possible_image_contents
+
+
+def _make_config(
+    *,
+    text_batch_size: int = 1,
+    image_batch_size: int = 1,
+    audio_batch_size: int = 1,
+    video_batch_size: int = 1,
+) -> UserConfig:
+    """Helper to create a UserConfig with specific batch sizes."""
+    return UserConfig(
+        endpoint=EndpointConfig(model_names=["test-model"]),
+        input=InputConfig.model_construct(
+            prompt=PromptConfig.model_construct(batch_size=text_batch_size),
+            image=ImageConfig.model_construct(batch_size=image_batch_size),
+            audio=AudioConfig.model_construct(batch_size=audio_batch_size),
+            video=VideoConfig.model_construct(batch_size=video_batch_size),
+        ),
+    )
+
+
+class TestRandomPoolBatchSize:
+    """Tests for batch_size support in RandomPoolDatasetLoader."""
+
+    def test_default_batch_size_uses_default_path(self, default_user_config):
+        """batch_size=1 (default) should use the default entry-level sampling path."""
+        loader = RandomPoolDatasetLoader(
+            filename="dummy.jsonl", user_config=default_user_config
+        )
+        assert not loader._has_batch_override()
+
+    @pytest.mark.parametrize(
+        "text_bs,image_bs,audio_bs,video_bs",
+        [
+            (2, 1, 1, 1),
+            (1, 3, 1, 1),
+            (1, 1, 2, 1),
+            (1, 1, 1, 4),
+            (3, 2, 1, 1),
+        ],
+    )
+    def test_has_batch_override_detects_non_default(
+        self, text_bs, image_bs, audio_bs, video_bs
+    ):
+        """Any batch_size > 1 should trigger the batched path."""
+        config = _make_config(
+            text_batch_size=text_bs,
+            image_batch_size=image_bs,
+            audio_batch_size=audio_bs,
+            video_batch_size=video_bs,
+        )
+        loader = RandomPoolDatasetLoader(filename="dummy.jsonl", user_config=config)
+        assert loader._has_batch_override()
+
+    def test_text_batch_size_simple_entries(self):
+        """batch_size_text > 1 should sample multiple texts from the pool."""
+        config = _make_config(text_batch_size=3)
+        data = {
+            "data.jsonl": [
+                RandomPool(text="alpha"),
+                RandomPool(text="beta"),
+                RandomPool(text="gamma"),
+                RandomPool(text="delta"),
+            ]
+        }
+
+        loader = RandomPoolDatasetLoader(
+            filename="dummy.jsonl", user_config=config, num_conversations=2
+        )
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 2
+        for conv in conversations:
+            assert len(conv.turns) == 1
+            turn = conv.turns[0]
+            # Should have exactly one Text object with batch_size contents
+            assert len(turn.texts) == 1
+            assert len(turn.texts[0].contents) == 3
+            # All sampled items should come from the pool
+            pool = {"alpha", "beta", "gamma", "delta"}
+            assert all(c in pool for c in turn.texts[0].contents)
+            # Without replacement: all items in a single sample should be unique
+            assert len(set(turn.texts[0].contents)) == 3
+
+    def test_text_batch_size_with_plural_entries(self):
+        """batch_size_text should flatten plural texts fields into the pool."""
+        config = _make_config(text_batch_size=2)
+        data = {
+            "data.jsonl": [
+                RandomPool(texts=["one", "two"]),
+                RandomPool(texts=["three", "four"]),
+            ]
+        }
+
+        loader = RandomPoolDatasetLoader(
+            filename="dummy.jsonl", user_config=config, num_conversations=1
+        )
+        conversations = loader.convert_to_conversations(data)
+
+        turn = conversations[0].turns[0]
+        assert len(turn.texts) == 1
+        assert len(turn.texts[0].contents) == 2
+        pool = {"one", "two", "three", "four"}
+        assert all(c in pool for c in turn.texts[0].contents)
+
+    def test_image_batch_size(self):
+        """batch_size_image > 1 should sample multiple images from the pool."""
+        config = _make_config(image_batch_size=2)
+        data = {
+            "data.jsonl": [
+                RandomPool(text="q1", image="https://example.com/img1.png"),
+                RandomPool(text="q2", image="https://example.com/img2.png"),
+                RandomPool(text="q3", image="https://example.com/img3.png"),
+            ]
+        }
+
+        loader = RandomPoolDatasetLoader(
+            filename="dummy.jsonl", user_config=config, num_conversations=1
+        )
+        conversations = loader.convert_to_conversations(data)
+
+        turn = conversations[0].turns[0]
+        # Text batch_size=1, so text pool still produces 1 item
+        assert len(turn.texts) == 1
+        assert len(turn.texts[0].contents) == 1
+        # Image batch_size=2
+        assert len(turn.images) == 1
+        assert len(turn.images[0].contents) == 2
+        image_pool = {
+            "https://example.com/img1.png",
+            "https://example.com/img2.png",
+            "https://example.com/img3.png",
+        }
+        assert all(c in image_pool for c in turn.images[0].contents)
+
+    def test_mixed_batch_sizes(self):
+        """Different batch sizes for different modalities."""
+        config = _make_config(text_batch_size=2, image_batch_size=3)
+        data = {
+            "data.jsonl": [
+                RandomPool(text="t1", image="https://example.com/i1.png"),
+                RandomPool(text="t2", image="https://example.com/i2.png"),
+                RandomPool(text="t3", image="https://example.com/i3.png"),
+                RandomPool(text="t4", image="https://example.com/i4.png"),
+            ]
+        }
+
+        loader = RandomPoolDatasetLoader(
+            filename="dummy.jsonl", user_config=config, num_conversations=1
+        )
+        conversations = loader.convert_to_conversations(data)
+
+        turn = conversations[0].turns[0]
+        assert len(turn.texts[0].contents) == 2
+        assert len(turn.images[0].contents) == 3
+
+    def test_batch_size_with_named_text_objects(self):
+        """batch_size should work with named Text objects, sampling per name group."""
+        config = _make_config(text_batch_size=2)
+        data = {
+            "data.jsonl": [
+                RandomPool(texts=[Text(name="query", contents=["q1"])]),
+                RandomPool(texts=[Text(name="query", contents=["q2"])]),
+                RandomPool(texts=[Text(name="query", contents=["q3"])]),
+            ]
+        }
+
+        loader = RandomPoolDatasetLoader(
+            filename="dummy.jsonl", user_config=config, num_conversations=1
+        )
+        conversations = loader.convert_to_conversations(data)
+
+        turn = conversations[0].turns[0]
+        assert len(turn.texts) == 1
+        assert turn.texts[0].name == "query"
+        assert len(turn.texts[0].contents) == 2
+        assert all(c in {"q1", "q2", "q3"} for c in turn.texts[0].contents)
+
+    def test_batch_size_directory_mode(self):
+        """batch_size should work in directory mode (multiple file pools merged)."""
+        config = _make_config(text_batch_size=2)
+        data = {
+            "queries.jsonl": [
+                RandomPool(text="q1"),
+                RandomPool(text="q2"),
+                RandomPool(text="q3"),
+            ],
+            "passages.jsonl": [
+                RandomPool(text="p1"),
+                RandomPool(text="p2"),
+                RandomPool(text="p3"),
+            ],
+        }
+
+        loader = RandomPoolDatasetLoader(
+            filename="dummy_dir", user_config=config, num_conversations=1
+        )
+        conversations = loader.convert_to_conversations(data)
+
+        turn = conversations[0].turns[0]
+        # Two Text objects (one per file pool), each with batch_size contents
+        assert len(turn.texts) == 2
+        names = {t.name for t in turn.texts}
+        assert names == {"queries", "passages"}
+        for text_obj in turn.texts:
+            assert len(text_obj.contents) == 2
+
+    def test_batch_size_exceeds_pool_raises_error(self):
+        """batch_size > pool size should raise ValueError."""
+        config = _make_config(text_batch_size=5)
+        data = {
+            "data.jsonl": [
+                RandomPool(text="only_one"),
+                RandomPool(text="only_two"),
+            ]
+        }
+
+        loader = RandomPoolDatasetLoader(
+            filename="dummy.jsonl", user_config=config, num_conversations=1
+        )
+        with pytest.raises(ValueError, match="Batch size 5 for text"):
+            loader.convert_to_conversations(data)
+
+    def test_batch_size_equals_pool_size(self):
+        """batch_size == pool size should work (samples all without replacement)."""
+        config = _make_config(text_batch_size=3)
+        data = {
+            "data.jsonl": [
+                RandomPool(text="a"),
+                RandomPool(text="b"),
+                RandomPool(text="c"),
+            ]
+        }
+
+        loader = RandomPoolDatasetLoader(
+            filename="dummy.jsonl", user_config=config, num_conversations=1
+        )
+        conversations = loader.convert_to_conversations(data)
+
+        turn = conversations[0].turns[0]
+        assert len(turn.texts[0].contents) == 3
+        assert set(turn.texts[0].contents) == {"a", "b", "c"}
+
+    def test_default_behavior_unchanged(self, default_user_config):
+        """Regression: batch_size=1 should produce identical results to original code."""
+        data = {
+            "file.jsonl": [
+                RandomPool(text="hello"),
+                RandomPool(text="world"),
+            ]
+        }
+
+        loader = RandomPoolDatasetLoader(
+            filename="dummy.jsonl",
+            user_config=default_user_config,
+            num_conversations=3,
+        )
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 3
+        for conv in conversations:
+            assert len(conv.turns) == 1
+            turn = conv.turns[0]
+            # Default path: one Text with one content (from a single sampled entry)
+            assert len(turn.texts) == 1
+            assert len(turn.texts[0].contents) == 1
+            assert turn.texts[0].contents[0] in {"hello", "world"}
+
+    def test_batch_size_only_affects_present_modalities(self):
+        """Modalities not in the data should produce empty lists even with batch_size > 1."""
+        config = _make_config(text_batch_size=2, image_batch_size=3)
+        data = {
+            "data.jsonl": [
+                RandomPool(text="t1"),
+                RandomPool(text="t2"),
+                RandomPool(text="t3"),
+            ]
+        }
+
+        loader = RandomPoolDatasetLoader(
+            filename="dummy.jsonl", user_config=config, num_conversations=1
+        )
+        conversations = loader.convert_to_conversations(data)
+
+        turn = conversations[0].turns[0]
+        assert len(turn.texts[0].contents) == 2
+        # No images in the pool, so images should be empty
+        assert len(turn.images) == 0
+
+    def test_batch_size_multiple_conversations(self):
+        """Each conversation should get independently sampled batches."""
+        config = _make_config(text_batch_size=2)
+        data = {
+            "data.jsonl": [
+                RandomPool(text="a"),
+                RandomPool(text="b"),
+                RandomPool(text="c"),
+                RandomPool(text="d"),
+            ]
+        }
+
+        loader = RandomPoolDatasetLoader(
+            filename="dummy.jsonl", user_config=config, num_conversations=5
+        )
+        conversations = loader.convert_to_conversations(data)
+
+        assert len(conversations) == 5
+        pool = {"a", "b", "c", "d"}
+        for conv in conversations:
+            turn = conv.turns[0]
+            assert len(turn.texts[0].contents) == 2
+            assert all(c in pool for c in turn.texts[0].contents)
+            # Each sample is without replacement (unique within one turn)
+            assert len(set(turn.texts[0].contents)) == 2

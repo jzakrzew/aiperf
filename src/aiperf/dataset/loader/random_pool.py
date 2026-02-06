@@ -11,6 +11,7 @@ from aiperf.common import random_generator as rng
 from aiperf.common.config.user_config import UserConfig
 from aiperf.common.enums import MediaType
 from aiperf.common.models import Conversation, Turn
+from aiperf.common.types import MediaTypeT
 from aiperf.dataset.loader.base_loader import BaseFileLoader
 from aiperf.dataset.loader.mixins import MediaConversionMixin
 from aiperf.dataset.loader.models import RandomPool
@@ -18,6 +19,8 @@ from aiperf.plugin.enums import CustomDatasetType, DatasetSamplingStrategy
 
 # Type aliases
 Filename: TypeAlias = str
+# Mapping from media type to named content pools: {name: [content_strings]}
+ContentPools: TypeAlias = dict[MediaTypeT, dict[str, list[str]]]
 
 
 class RandomPoolDatasetLoader(BaseFileLoader, MediaConversionMixin):
@@ -225,6 +228,188 @@ class RandomPoolDatasetLoader(BaseFileLoader, MediaConversionMixin):
         """Convert random pool data to conversation objects.
 
         Each RandomPool entry becomes a single-turn conversation with a unique session ID.
+        When any modality batch_size > 1, switches to content-level sampling where
+        individual contents are randomly sampled from the pool (matching genai-perf
+        behavior for embedding/ranking endpoints).
+
+        Args:
+            data: A dictionary mapping filename to list of RandomPool objects.
+
+        Returns:
+            A list of conversations.
+        """
+        if self._has_batch_override():
+            return self._convert_with_batching(data)
+        return self._convert_default(data)
+
+    def _has_batch_override(self) -> bool:
+        """Check if any modality batch_size exceeds the default of 1.
+
+        Returns:
+            True if any batch_size > 1, indicating content-level batching is needed.
+        """
+        cfg = self.user_config.input
+        return any(
+            bs > 1
+            for bs in [
+                cfg.prompt.batch_size,
+                cfg.image.batch_size,
+                cfg.audio.batch_size,
+                cfg.video.batch_size,
+            ]
+        )
+
+    def _get_batch_size(self, modality: MediaTypeT) -> int:
+        """Get the configured batch size for a given modality.
+
+        Args:
+            modality: The media type (e.g. MediaType.TEXT, MediaType.IMAGE).
+
+        Returns:
+            The batch size for the modality.
+        """
+        cfg = self.user_config.input
+        batch_size_map: dict[MediaTypeT, int] = {
+            MediaType.TEXT: cfg.prompt.batch_size,
+            MediaType.IMAGE: cfg.image.batch_size,
+            MediaType.AUDIO: cfg.audio.batch_size,
+            MediaType.VIDEO: cfg.video.batch_size,
+        }
+        return batch_size_map[modality]
+
+    def _build_content_pools(
+        self, entries: list[RandomPool], default_name: str
+    ) -> ContentPools:
+        """Extract and flatten all contents from pool entries, grouped by (modality, name).
+
+        Uses MediaConversionMixin.convert_to_media_objects() to normalize all entry
+        formats (singular, plural, named objects) into Media objects, then flattens
+        their contents into pools keyed by name.
+
+        Args:
+            entries: The RandomPool entries from a single file.
+            default_name: The default name for unnamed media fields (typically filename stem).
+
+        Returns:
+            A nested dict: {media_type: {name: [content_strings]}}.
+        """
+        pools: ContentPools = {
+            media_type: defaultdict(list)
+            for media_type in [
+                MediaType.TEXT,
+                MediaType.IMAGE,
+                MediaType.AUDIO,
+                MediaType.VIDEO,
+            ]
+        }
+
+        for entry in entries:
+            media = self.convert_to_media_objects(entry, name=default_name)
+            for media_type, media_objects in media.items():
+                for media_obj in media_objects:
+                    pools[media_type][media_obj.name].extend(media_obj.contents)
+
+        return pools
+
+    def _validate_batch_sizes(self, pools: ContentPools, filename: str) -> None:
+        """Validate that batch sizes don't exceed available pool sizes.
+
+        Args:
+            pools: The content pools built from a file.
+            filename: The source filename (for error messages).
+
+        Raises:
+            ValueError: If any batch_size exceeds the pool size for a modality.
+        """
+        for media_type, named_pools in pools.items():
+            batch_size = self._get_batch_size(media_type)
+            for name, contents in named_pools.items():
+                if batch_size > len(contents):
+                    field_desc = f"{media_type} (name={name!r})" if name else media_type
+                    raise ValueError(
+                        f"Batch size {batch_size} for {field_desc} exceeds the number "
+                        f"of available items ({len(contents)}) in pool '{filename}'. "
+                        f"Provide more data or reduce --batch-size-{media_type}."
+                    )
+
+    def _convert_with_batching(
+        self, data: dict[Filename, list[RandomPool]]
+    ) -> list[Conversation]:
+        """Convert pool data using content-level sampling for batched requests.
+
+        Instead of sampling whole RandomPool entries, this flattens all contents
+        per modality into pools and samples batch_size items (without replacement)
+        for each conversation. This matches genai-perf behavior for embedding and
+        ranking endpoints where each request carries multiple inputs.
+
+        Args:
+            data: A dictionary mapping filename to list of RandomPool objects.
+
+        Returns:
+            A list of conversations.
+        """
+        from aiperf.common.models import Audio, Image, Text, Video
+
+        media_class_map = {
+            MediaType.TEXT: Text,
+            MediaType.IMAGE: Image,
+            MediaType.AUDIO: Audio,
+            MediaType.VIDEO: Video,
+        }
+
+        conversations = [
+            Conversation(session_id=self.session_id_generator.next())
+            for _ in range(self.num_conversations)
+        ]
+
+        # F x N (F: num of files, N: num of conversations)
+        sampled_dataset: dict[Filename, list[Turn]] = {}
+
+        for filename, dataset_pool in data.items():
+            default_name = Path(filename).stem
+            pools = self._build_content_pools(dataset_pool, default_name)
+            self._validate_batch_sizes(pools, filename)
+
+            turns: list[Turn] = []
+            for _ in range(self.num_conversations):
+                turn_media: dict[MediaTypeT, list] = {
+                    MediaType.TEXT: [],
+                    MediaType.IMAGE: [],
+                    MediaType.AUDIO: [],
+                    MediaType.VIDEO: [],
+                }
+                for media_type, named_pools in pools.items():
+                    batch_size = self._get_batch_size(media_type)
+                    media_cls = media_class_map[media_type]
+                    for name, contents in named_pools.items():
+                        sampled = self._rng.sample(contents, k=batch_size)
+                        turn_media[media_type].append(
+                            media_cls(name=name, contents=sampled)
+                        )
+                turns.append(
+                    Turn(
+                        texts=turn_media[MediaType.TEXT],
+                        images=turn_media[MediaType.IMAGE],
+                        audios=turn_media[MediaType.AUDIO],
+                        videos=turn_media[MediaType.VIDEO],
+                    )
+                )
+            sampled_dataset[filename] = turns
+
+        # Merge turns for each conversation (same as default path)
+        for i, batched_turns in enumerate(zip(*sampled_dataset.values(), strict=False)):
+            turn = self._merge_turns(batched_turns)
+            conversations[i].turns.append(turn)
+
+        return conversations
+
+    def _convert_default(
+        self, data: dict[Filename, list[RandomPool]]
+    ) -> list[Conversation]:
+        """Convert pool data using default entry-level sampling.
+
+        Each conversation gets one randomly sampled RandomPool entry per file pool.
+        This preserves cross-modality correlations within entries.
 
         Args:
             data: A dictionary mapping filename to list of RandomPool objects.
